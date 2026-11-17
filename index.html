@@ -253,22 +253,28 @@
 
     <script>
       const SPLIT_ASSETS = [
-        { match: "CupheadPort.data.unityweb", base: "Build/CupheadPort.data.unityweb", start: 1, end: 103 },
-        { match: "CupheadPort.wasm.code.unityweb", base: "Build/CupheadPort.wasm.code.unityweb", start: 1, end: 2 },
-        { match: "CupheadPort.asm.code.unityweb", base: "Build/CupheadPort.asm.code.unityweb", start: 1, end: 3 },
+        { match: "CupheadPort.data.unityweb", base: "Build/CupheadPort.data.unityweb", start: 1, end: 103, maxMB: 3200 },
+        { match: "CupheadPort.wasm.code.unityweb", base: "Build/CupheadPort.wasm.code.unityweb", start: 1, end: 2, maxMB: 128 },
+        { match: "CupheadPort.asm.code.unityweb", base: "Build/CupheadPort.asm.code.unityweb", start: 1, end: 3, maxMB: 128 },
       ];
 
       const TOTAL_PARTS = SPLIT_ASSETS.reduce((sum, a) => sum + (a.end - a.start + 1), 0);
-      const FALLBACK_TOTAL_BYTES = 2101.31 * 1024 * 1024;
-      const STREAM_CONCURRENCY = 2; // Keep low to avoid multiple concurrent buffers in RAM
-      const HEAD_CONCURRENCY = 10;
+      const EXPECTED_TOTAL_BYTES = 2101.31 * 1024 * 1024;
 
-      let globalTotalBytes = FALLBACK_TOTAL_BYTES;
-      let globalKnownBytes = 0;
+      let globalTotalBytes = EXPECTED_TOTAL_BYTES;
       let globalLoadedBytes = 0;
       let globalCompletedParts = 0;
 
-      // Holds references to completed XHR buffers so they can be freed right after Unity unpacks them
+      const supportsResizableAB = (() => {
+        try {
+          const test = new ArrayBuffer(0, { maxByteLength: 1024 });
+          test.resize(512);
+          return test.byteLength === 512;
+        } catch (_) {
+          return false;
+        }
+      })();
+
       const activeBufferReleasers = [];
 
       function getPartUrls(asset) {
@@ -279,93 +285,111 @@
         return urls;
       }
 
-      async function runPool(items, concurrency, worker) {
-        const results = new Array(items.length);
-        let index = 0;
-        async function next() {
-          while (index < items.length) {
-            const i = index++;
-            results[i] = await worker(items[i], i);
-          }
-        }
-        await Promise.all(
-          Array.from({ length: Math.min(concurrency, items.length) }, () => next())
-        );
-        return results;
-      }
+      // Streams all parts of an asset sequentially into a single in-place resizable ArrayBuffer
+      async function streamAssetInPlace(asset, onProgressUpdate, registerReleaser) {
+        const partUrls = getPartUrls(asset);
+        let ab = null;
+        let fallbackChunks = null;
+        let writeOffset = 0;
 
-      async function getExactPartSizes(partUrls, assetName) {
-        logStatus(`Probing exact byte sizes for ${assetName} (${partUrls.length} parts)...`);
-        const sizes = await runPool(partUrls, HEAD_CONCURRENCY, async (url) => {
-          const res = await fetch(url, { method: "HEAD" });
-          if (!res.ok) {
-            throw new Error(`HTTP ${res.status} (${res.statusText}) probing ${url}`);
-          }
-          const len = Number(res.headers.get("content-length"));
-          if (!Number.isFinite(len) || len <= 0) {
-            throw new Error(`Missing or invalid Content-Length for ${url}`);
-          }
-          return len;
+        if (supportsResizableAB) {
+          ab = new ArrayBuffer(0, { maxByteLength: asset.maxMB * 1024 * 1024 });
+        } else {
+          fallbackChunks = [];
+        }
+
+        registerReleaser(() => {
+          ab = null;
+          fallbackChunks = null;
         });
 
-        const offsets = new Array(sizes.length);
-        let total = 0;
-        for (let i = 0; i < sizes.length; i++) {
-          offsets[i] = total;
-          total += sizes[i];
-        }
-        return { sizes, offsets, total };
-      }
+        for (let i = 0; i < partUrls.length; i++) {
+          const url = partUrls[i];
+          const partStartOffset = writeOffset;
+          const fallbackStartLen = fallbackChunks ? fallbackChunks.length : 0;
+          const retries = 3;
 
-      async function streamPartIntoBuffer(url, targetView, startOffset, expectedLength, onBytesChunk, retries = 3) {
-        for (let attempt = 0; attempt <= retries; attempt++) {
-          let writtenInAttempt = 0;
-          try {
-            const response = await fetch(url);
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status} (${response.statusText}) fetching ${url}`);
-            }
-
-            if (!response.body) {
-              const buf = new Uint8Array(await response.arrayBuffer());
-              if (buf.length !== expectedLength) {
-                throw new Error(`Size mismatch for ${url}: expected ${expectedLength}, got ${buf.length}`);
+          for (let attempt = 0; attempt <= retries; attempt++) {
+            let bytesThisAttempt = 0;
+            try {
+              const response = await fetch(url);
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status} (${response.statusText}) fetching ${url}`);
               }
-              targetView.set(buf, startOffset);
-              writtenInAttempt = buf.length;
-              onBytesChunk(buf.length);
-              return;
-            }
 
-            const reader = response.body.getReader();
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (writtenInAttempt + value.length > expectedLength) {
-                throw new Error(`Overflow on ${url}: exceeded expected ${expectedLength} bytes`);
+              const appendBytes = (chunkUint8) => {
+                if (supportsResizableAB) {
+                  const nextOffset = writeOffset + chunkUint8.length;
+                  ab.resize(nextOffset);
+                  new Uint8Array(ab, writeOffset, chunkUint8.length).set(chunkUint8);
+                  writeOffset = nextOffset;
+                } else {
+                  fallbackChunks.push(chunkUint8);
+                  writeOffset += chunkUint8.length;
+                }
+                bytesThisAttempt += chunkUint8.length;
+                globalLoadedBytes += chunkUint8.length;
+                if (globalLoadedBytes > globalTotalBytes) {
+                  globalTotalBytes = globalLoadedBytes;
+                }
+                onProgressUpdate(writeOffset);
+              };
+
+              if (!response.body) {
+                const buf = new Uint8Array(await response.arrayBuffer());
+                appendBytes(buf);
+              } else {
+                const reader = response.body.getReader();
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  appendBytes(value);
+                }
               }
-              targetView.set(value, startOffset + writtenInAttempt);
-              writtenInAttempt += value.length;
-              onBytesChunk(value.length);
-            }
 
-            if (writtenInAttempt !== expectedLength) {
-              throw new Error(`Incomplete read on ${url}: expected ${expectedLength}, got ${writtenInAttempt}`);
-            }
-            return;
-          } catch (err) {
-            if (writtenInAttempt > 0) {
-              onBytesChunk(-writtenInAttempt);
-            }
-            if (attempt < retries) {
-              logStatus(`Retrying ${url} (attempt ${attempt + 2}/${retries + 1}): ${err.message}`, "warn");
-              await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
-            } else {
-              throw err;
+              globalCompletedParts++;
+              onProgressUpdate(writeOffset);
+              break; // Part succeeded
+            } catch (err) {
+              // Roll back partial writes from failed attempt
+              globalLoadedBytes = Math.max(0, globalLoadedBytes - bytesThisAttempt);
+              writeOffset = partStartOffset;
+              if (supportsResizableAB && ab) {
+                ab.resize(partStartOffset);
+              } else if (fallbackChunks) {
+                fallbackChunks.length = fallbackStartLen;
+              }
+
+              if (attempt < retries) {
+                logStatus(`Retrying ${url} (attempt ${attempt + 2}/${retries + 1}): ${err.message}`, "warn");
+                await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+              } else {
+                throw err;
+              }
             }
           }
         }
+
+        if (supportsResizableAB) {
+          return ab;
+        }
+
+        // Fallback assembly if browser lacks ArrayBuffer.prototype.resize
+        const assembled = new Uint8Array(writeOffset);
+        let offset = 0;
+        for (let i = 0; i < fallbackChunks.length; i++) {
+          assembled.set(fallbackChunks[i], offset);
+          offset += fallbackChunks[i].length;
+          fallbackChunks[i] = null;
+        }
+        fallbackChunks = null;
+        const resultBuffer = assembled.buffer;
+        registerReleaser(() => {});
+        return resultBuffer;
       }
+
+      // Serialize large asset streams so multiple multi-hundred-MB downloads don't overlap in RAM
+      let assetStreamQueue = Promise.resolve();
 
       function installStreamingXHRInterceptor() {
         const NativeXHR = window.XMLHttpRequest;
@@ -387,7 +411,6 @@
 
           this._splitIntercept = {
             asset: matchedAsset,
-            method,
             url: new URL(urlStr, document.baseURI).href,
             readyState: 1,
             status: 0,
@@ -444,84 +467,74 @@
           const state = this._splitIntercept;
           const asset = state.asset;
 
-          (async () => {
+          assetStreamQueue = assetStreamQueue.then(async () => {
             try {
-              const partUrls = getPartUrls(asset);
-              const { sizes, offsets, total } = await getExactPartSizes(partUrls, asset.match);
-
-              state.totalBytes = total;
-              globalKnownBytes += total;
-              if (globalKnownBytes > globalTotalBytes) {
-                globalTotalBytes = globalKnownBytes;
-              }
-
-              logStatus(`Allocating single ${(total / (1024 * 1024)).toFixed(2)} MB buffer for ${asset.match}...`);
-              let singleBuffer = new Uint8Array(total);
-              let assetLoadedBytes = 0;
-
-              activeBufferReleasers.push(() => {
-                singleBuffer = null;
-                state.response = null;
-              });
+              const totalPartsForAsset = asset.end - asset.start + 1;
+              logStatus(`Streaming ${asset.match} (${totalPartsForAsset} parts) into single buffer...`);
 
               state.readyState = 2;
               xhr.dispatchEvent(new Event("readystatechange"));
               state.readyState = 3;
               xhr.dispatchEvent(new Event("readystatechange"));
 
-              const indices = Array.from({ length: partUrls.length }, (_, i) => i);
-              await runPool(indices, STREAM_CONCURRENCY, async (partIdx) => {
-                await streamPartIntoBuffer(
-                  partUrls[partIdx],
-                  singleBuffer,
-                  offsets[partIdx],
-                  sizes[partIdx],
-                  (deltaBytes) => {
-                    assetLoadedBytes += deltaBytes;
-                    globalLoadedBytes += deltaBytes;
+              let releaseInternal = () => {};
+              const buffer = await streamAssetInPlace(
+                asset,
+                (assetBytesLoaded) => {
+                  const mbDone = (globalLoadedBytes / (1024 * 1024)).toFixed(2);
+                  const mbTotal = (globalTotalBytes / (1024 * 1024)).toFixed(2);
+                  const ratio = Math.min(1, globalLoadedBytes / globalTotalBytes);
+                  const mappedProgress = ratio * 0.85;
 
-                    const mbDone = (globalLoadedBytes / (1024 * 1024)).toFixed(2);
-                    const mbTotal = (globalTotalBytes / (1024 * 1024)).toFixed(2);
-                    const ratio = Math.min(1, globalLoadedBytes / globalTotalBytes);
-                    // Map streaming download across 0.00 -> 0.85 of total progress
-                    const mappedProgress = ratio * 0.85;
+                  setUnityProgress(
+                    mappedProgress,
+                    `Downloading data... (${Math.round(ratio * 100)}%)`,
+                    `Stage: Streaming ${asset.match} (${globalCompletedParts}/${TOTAL_PARTS} parts)`,
+                    `${mbDone} MB / ${mbTotal} MB`
+                  );
 
-                    setUnityProgress(
-                      mappedProgress,
-                      `Downloading data... (${Math.round(ratio * 100)}%)`,
-                      `Stage: Streaming ${asset.match} (${globalCompletedParts}/${TOTAL_PARTS} parts)`,
-                      `${mbDone} MB / ${mbTotal} MB`
-                    );
+                  xhr.dispatchEvent(
+                    new ProgressEvent("progress", {
+                      lengthComputable: false,
+                      loaded: assetBytesLoaded,
+                      total: 0,
+                    })
+                  );
+                },
+                (fn) => {
+                  releaseInternal = fn;
+                }
+              );
 
-                    xhr.dispatchEvent(
-                      new ProgressEvent("progress", {
-                        lengthComputable: true,
-                        loaded: Math.max(0, assetLoadedBytes),
-                        total,
-                      })
-                    );
-                  }
-                );
-                globalCompletedParts++;
+              activeBufferReleasers.push(() => {
+                releaseInternal();
+                state.response = null;
               });
 
-              logStatus(`Completed streaming ${asset.match} (${(total / (1024 * 1024)).toFixed(2)} MB).`);
+              state.totalBytes = buffer.byteLength;
+              logStatus(`Completed ${asset.match}: ${(buffer.byteLength / (1024 * 1024)).toFixed(2)} MB.`);
 
               state.status = 200;
               state.statusText = "OK";
-              state.response = singleBuffer.buffer;
+              state.response = buffer;
               state.readyState = 4;
 
               xhr.dispatchEvent(new Event("readystatechange"));
               xhr.dispatchEvent(
                 new ProgressEvent("progress", {
                   lengthComputable: true,
-                  loaded: total,
-                  total,
+                  loaded: buffer.byteLength,
+                  total: buffer.byteLength,
                 })
               );
               xhr.dispatchEvent(new Event("load"));
               xhr.dispatchEvent(new Event("loadend"));
+
+              // Release XHR wrapper reference immediately after UnityLoader's onload callback consumes it
+              setTimeout(() => {
+                releaseInternal();
+                state.response = null;
+              }, 0);
             } catch (err) {
               hasFatalError = true;
               reportError(`StreamXHR:${asset.match}`, err);
@@ -532,7 +545,7 @@
               xhr.dispatchEvent(new Event("error"));
               xhr.dispatchEvent(new Event("loadend"));
             }
-          })();
+          });
         };
       }
 
@@ -568,7 +581,7 @@
           }
 
           installStreamingXHRInterceptor();
-          logStatus("Single-buffer streaming XHR interceptor installed.");
+          logStatus(`In-place Resizable ArrayBuffer support: ${supportsResizableAB ? "ENABLED" : "FALLBACK"}`);
           logStatus("Calling UnityLoader.instantiate('gameContainer', 'Build/CupheadPort.json')...");
 
           let lastReportedStage = "";
@@ -584,7 +597,6 @@
                 logStatus("Unity WebGL API: Downloading data...");
               }
             } else if (progress < 1) {
-              // Unity has finished reading XHR responses and is now compiling WASM / initializing runtime
               releaseDownloadedBuffers();
               const combinedProgress = 0.85 + ((progress - 0.9) / 0.1) * 0.15;
               setUnityProgress(
