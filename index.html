@@ -52,7 +52,7 @@
 
       /* Detailed Status Bar Container */
       #status-container {
-        width: min(720px, 92vw);
+        width: min(760px, 92vw);
         display: flex;
         flex-direction: column;
         gap: 10px;
@@ -105,6 +105,7 @@
         color: #cccccc;
         display: flex;
         justify-content: space-between;
+        flex-wrap: wrap;
         gap: 12px;
       }
 
@@ -112,7 +113,7 @@
       #status-log {
         margin-top: 6px;
         width: 100%;
-        height: 180px;
+        height: 190px;
         background-color: #080808;
         border: 1px solid #444444;
         padding: 10px;
@@ -157,7 +158,7 @@
         </div>
 
         <div id="sub-status">
-          <span id="sub-status-left">Stage: Asset Preload</span>
+          <span id="sub-status-left">Stage: Bootstrapping</span>
           <span id="sub-status-right">0.00 MB / 2101.31 MB</span>
         </div>
 
@@ -192,6 +193,15 @@
         return new Date().toISOString().split("T")[1].replace("Z", "");
       }
 
+      function getMemoryLabel() {
+        if (performance && performance.memory) {
+          const usedMB = (performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(0);
+          const limitMB = (performance.memory.jsHeapSizeLimit / (1024 * 1024)).toFixed(0);
+          return ` | JS Heap: ${usedMB}/${limitMB} MB`;
+        }
+        return "";
+      }
+
       function logStatus(message, level = "info") {
         const entry = document.createElement("div");
         entry.className = `log-entry log-${level}`;
@@ -216,7 +226,7 @@
         unityApiStatus.textContent = statusLabel;
         unityApiPercent.textContent = `${pct}% (${clamped.toFixed(2)})`;
         if (stageText !== undefined) subStatusLeft.textContent = stageText;
-        if (transferText !== undefined) subStatusRight.textContent = transferText;
+        if (transferText !== undefined) subStatusRight.textContent = transferText + getMemoryLabel();
       }
 
       window.addEventListener("error", (event) => {
@@ -242,144 +252,297 @@
     ></script>
 
     <script>
-      const EXPECTED_TOTAL_MB = 2101.31;
-      const EXPECTED_TOTAL_BYTES = EXPECTED_TOTAL_MB * 1024 * 1024;
-      const TOTAL_PARTS = 103 + 2 + 3; // 108 total split chunks
-      const MAX_CONCURRENT_DOWNLOADS = 6;
-      let loadedBytes = 0;
-      let completedParts = 0;
+      const SPLIT_ASSETS = [
+        { match: "CupheadPort.data.unityweb", base: "Build/CupheadPort.data.unityweb", start: 1, end: 103 },
+        { match: "CupheadPort.wasm.code.unityweb", base: "Build/CupheadPort.wasm.code.unityweb", start: 1, end: 2 },
+        { match: "CupheadPort.asm.code.unityweb", base: "Build/CupheadPort.asm.code.unityweb", start: 1, end: 3 },
+      ];
 
-      function updateDownloadProgress(currentFile) {
-        const mbDone = (loadedBytes / (1024 * 1024)).toFixed(2);
-        const totalMbDisplay = Math.max(EXPECTED_TOTAL_MB, parseFloat(mbDone)).toFixed(2);
-        const rawRatio = Math.min(1, loadedBytes / EXPECTED_TOTAL_BYTES);
-        const mappedProgress = rawRatio * 0.75;
+      const TOTAL_PARTS = SPLIT_ASSETS.reduce((sum, a) => sum + (a.end - a.start + 1), 0);
+      const FALLBACK_TOTAL_BYTES = 2101.31 * 1024 * 1024;
+      const STREAM_CONCURRENCY = 2; // Keep low to avoid multiple concurrent buffers in RAM
+      const HEAD_CONCURRENCY = 10;
 
-        setUnityProgress(
-          mappedProgress,
-          `Downloading... (${mbDone} MB / ${totalMbDisplay} MB)`,
-          `Stage: Fetching Build Parts (${completedParts}/${TOTAL_PARTS}) — ${currentFile}`,
-          `${mbDone} MB / ${totalMbDisplay} MB`
-        );
-      }
+      let globalTotalBytes = FALLBACK_TOTAL_BYTES;
+      let globalKnownBytes = 0;
+      let globalLoadedBytes = 0;
+      let globalCompletedParts = 0;
 
-      async function fetchWithProgress(url, retries = 2) {
-        const resolvedUrl = new URL(url, document.baseURI).href;
+      // Holds references to completed XHR buffers so they can be freed right after Unity unpacks them
+      const activeBufferReleasers = [];
 
-        for (let attempt = 0; attempt <= retries; attempt++) {
-          let attemptBytes = 0;
-          try {
-            const response = await fetch(resolvedUrl);
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status} (${response.statusText}) while fetching ${resolvedUrl}`);
-            }
-
-            if (!response.body) {
-              const buffer = await response.arrayBuffer();
-              loadedBytes += buffer.byteLength;
-              completedParts++;
-              updateDownloadProgress(url);
-              return buffer;
-            }
-
-            const reader = response.body.getReader();
-            const chunks = [];
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              attemptBytes += value.length;
-              loadedBytes += value.length;
-              chunks.push(value);
-              updateDownloadProgress(url);
-            }
-
-            completedParts++;
-            updateDownloadProgress(url);
-
-            const fullBuffer = new Uint8Array(attemptBytes);
-            let offset = 0;
-            for (const chunk of chunks) {
-              fullBuffer.set(chunk, offset);
-              offset += chunk.length;
-            }
-            return fullBuffer.buffer;
-          } catch (err) {
-            // Roll back partial bytes from a failed attempt before retrying
-            loadedBytes = Math.max(0, loadedBytes - attemptBytes);
-            if (attempt < retries) {
-              logStatus(`Retrying ${url} (attempt ${attempt + 2}/${retries + 1}): ${err.message}`, "warn");
-              await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
-            } else {
-              throw new Error(`Failed to fetch ${resolvedUrl}: ${err.message}`);
-            }
-          }
+      function getPartUrls(asset) {
+        const urls = [];
+        for (let i = asset.start; i <= asset.end; i++) {
+          urls.push(new URL(`${asset.base}.part${i}`, document.baseURI).href);
         }
+        return urls;
       }
 
-      async function mapWithConcurrency(items, limit, worker) {
+      async function runPool(items, concurrency, worker) {
         const results = new Array(items.length);
-        let nextIndex = 0;
-
-        async function runWorker() {
-          while (nextIndex < items.length) {
-            const currentIndex = nextIndex++;
-            results[currentIndex] = await worker(items[currentIndex], currentIndex);
+        let index = 0;
+        async function next() {
+          while (index < items.length) {
+            const i = index++;
+            results[i] = await worker(items[i], i);
           }
         }
-
-        const workers = Array.from({ length: Math.min(limit, items.length) }, () => runWorker());
-        await Promise.all(workers);
+        await Promise.all(
+          Array.from({ length: Math.min(concurrency, items.length) }, () => next())
+        );
         return results;
       }
 
-      async function mergeFiles(fileParts, cacheKey) {
-        let cache = null;
-        try {
-          if ("caches" in window) {
-            cache = await caches.open("cuphead-cache");
-            const cachedResponse = await cache.match(cacheKey);
-            if (cachedResponse) {
-              const blob = await cachedResponse.blob();
-              loadedBytes += blob.size;
-              completedParts += fileParts.length;
-              logStatus(`Cache hit for ${cacheKey} (${(blob.size / (1024 * 1024)).toFixed(2)} MB)`);
-              updateDownloadProgress(cacheKey);
-              return URL.createObjectURL(blob);
-            }
+      async function getExactPartSizes(partUrls, assetName) {
+        logStatus(`Probing exact byte sizes for ${assetName} (${partUrls.length} parts)...`);
+        const sizes = await runPool(partUrls, HEAD_CONCURRENCY, async (url) => {
+          const res = await fetch(url, { method: "HEAD" });
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status} (${res.statusText}) probing ${url}`);
           }
-        } catch (cacheReadErr) {
-          reportError("CacheRead", `Could not read ${cacheKey} from cache: ${cacheReadErr.message}`);
-        }
-
-        logStatus(`Downloading ${fileParts.length} part(s) for ${cacheKey}...`);
-        const buffers = await mapWithConcurrency(
-          fileParts,
-          MAX_CONCURRENT_DOWNLOADS,
-          (part) => fetchWithProgress(part)
-        );
-
-        logStatus(`Merging ${buffers.length} buffer(s) into ${cacheKey}...`);
-        const mergedBlob = new Blob(buffers);
-
-        if (cache) {
-          try {
-            await cache.put(cacheKey, new Response(mergedBlob));
-            logStatus(`Cached ${cacheKey} (${(mergedBlob.size / (1024 * 1024)).toFixed(2)} MB)`);
-          } catch (cacheWriteErr) {
-            logStatus(`[CacheWarning] Failed to store ${cacheKey} in Cache API: ${cacheWriteErr.message}`, "warn");
+          const len = Number(res.headers.get("content-length"));
+          if (!Number.isFinite(len) || len <= 0) {
+            throw new Error(`Missing or invalid Content-Length for ${url}`);
           }
-        }
+          return len;
+        });
 
-        return URL.createObjectURL(mergedBlob);
+        const offsets = new Array(sizes.length);
+        let total = 0;
+        for (let i = 0; i < sizes.length; i++) {
+          offsets[i] = total;
+          total += sizes[i];
+        }
+        return { sizes, offsets, total };
       }
 
-      function getParts(file, start, end) {
-        const parts = [];
-        for (let i = start; i <= end; i++) {
-          parts.push(`${file}.part${i}`);
+      async function streamPartIntoBuffer(url, targetView, startOffset, expectedLength, onBytesChunk, retries = 3) {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          let writtenInAttempt = 0;
+          try {
+            const response = await fetch(url);
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} (${response.statusText}) fetching ${url}`);
+            }
+
+            if (!response.body) {
+              const buf = new Uint8Array(await response.arrayBuffer());
+              if (buf.length !== expectedLength) {
+                throw new Error(`Size mismatch for ${url}: expected ${expectedLength}, got ${buf.length}`);
+              }
+              targetView.set(buf, startOffset);
+              writtenInAttempt = buf.length;
+              onBytesChunk(buf.length);
+              return;
+            }
+
+            const reader = response.body.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (writtenInAttempt + value.length > expectedLength) {
+                throw new Error(`Overflow on ${url}: exceeded expected ${expectedLength} bytes`);
+              }
+              targetView.set(value, startOffset + writtenInAttempt);
+              writtenInAttempt += value.length;
+              onBytesChunk(value.length);
+            }
+
+            if (writtenInAttempt !== expectedLength) {
+              throw new Error(`Incomplete read on ${url}: expected ${expectedLength}, got ${writtenInAttempt}`);
+            }
+            return;
+          } catch (err) {
+            if (writtenInAttempt > 0) {
+              onBytesChunk(-writtenInAttempt);
+            }
+            if (attempt < retries) {
+              logStatus(`Retrying ${url} (attempt ${attempt + 2}/${retries + 1}): ${err.message}`, "warn");
+              await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+            } else {
+              throw err;
+            }
+          }
         }
-        return parts;
+      }
+
+      function installStreamingXHRInterceptor() {
+        const NativeXHR = window.XMLHttpRequest;
+        const nativeOpen = NativeXHR.prototype.open;
+        const nativeSend = NativeXHR.prototype.send;
+        const nativeSetRequestHeader = NativeXHR.prototype.setRequestHeader;
+        const nativeOverrideMimeType = NativeXHR.prototype.overrideMimeType;
+        const nativeGetResponseHeader = NativeXHR.prototype.getResponseHeader;
+        const nativeGetAllResponseHeaders = NativeXHR.prototype.getAllResponseHeaders;
+
+        NativeXHR.prototype.open = function (method, url, async = true, user, password) {
+          const urlStr = typeof url === "string" ? url : String(url);
+          const matchedAsset = SPLIT_ASSETS.find((a) => urlStr.includes(a.match));
+
+          if (!matchedAsset) {
+            this._splitIntercept = null;
+            return nativeOpen.call(this, method, url, async, user, password);
+          }
+
+          this._splitIntercept = {
+            asset: matchedAsset,
+            method,
+            url: new URL(urlStr, document.baseURI).href,
+            readyState: 1,
+            status: 0,
+            statusText: "",
+            response: null,
+            totalBytes: 0,
+          };
+
+          const state = this._splitIntercept;
+          Object.defineProperties(this, {
+            readyState: { get: () => state.readyState, configurable: true },
+            status: { get: () => state.status, configurable: true },
+            statusText: { get: () => state.statusText, configurable: true },
+            response: { get: () => state.response, configurable: true },
+            responseURL: { get: () => state.url, configurable: true },
+          });
+
+          this.dispatchEvent(new Event("readystatechange"));
+        };
+
+        NativeXHR.prototype.setRequestHeader = function (name, value) {
+          if (this._splitIntercept) return;
+          return nativeSetRequestHeader.call(this, name, value);
+        };
+
+        NativeXHR.prototype.overrideMimeType = function (mime) {
+          if (this._splitIntercept) return;
+          return nativeOverrideMimeType.call(this, mime);
+        };
+
+        NativeXHR.prototype.getResponseHeader = function (name) {
+          if (this._splitIntercept) {
+            const lower = String(name).toLowerCase();
+            if (lower === "content-length") return String(this._splitIntercept.totalBytes);
+            if (lower === "content-type") return "application/octet-stream";
+            return null;
+          }
+          return nativeGetResponseHeader.call(this, name);
+        };
+
+        NativeXHR.prototype.getAllResponseHeaders = function () {
+          if (this._splitIntercept) {
+            return `content-length: ${this._splitIntercept.totalBytes}\r\ncontent-type: application/octet-stream\r\n`;
+          }
+          return nativeGetAllResponseHeaders.call(this);
+        };
+
+        NativeXHR.prototype.send = function (body) {
+          if (!this._splitIntercept) {
+            return nativeSend.call(this, body);
+          }
+
+          const xhr = this;
+          const state = this._splitIntercept;
+          const asset = state.asset;
+
+          (async () => {
+            try {
+              const partUrls = getPartUrls(asset);
+              const { sizes, offsets, total } = await getExactPartSizes(partUrls, asset.match);
+
+              state.totalBytes = total;
+              globalKnownBytes += total;
+              if (globalKnownBytes > globalTotalBytes) {
+                globalTotalBytes = globalKnownBytes;
+              }
+
+              logStatus(`Allocating single ${(total / (1024 * 1024)).toFixed(2)} MB buffer for ${asset.match}...`);
+              let singleBuffer = new Uint8Array(total);
+              let assetLoadedBytes = 0;
+
+              activeBufferReleasers.push(() => {
+                singleBuffer = null;
+                state.response = null;
+              });
+
+              state.readyState = 2;
+              xhr.dispatchEvent(new Event("readystatechange"));
+              state.readyState = 3;
+              xhr.dispatchEvent(new Event("readystatechange"));
+
+              const indices = Array.from({ length: partUrls.length }, (_, i) => i);
+              await runPool(indices, STREAM_CONCURRENCY, async (partIdx) => {
+                await streamPartIntoBuffer(
+                  partUrls[partIdx],
+                  singleBuffer,
+                  offsets[partIdx],
+                  sizes[partIdx],
+                  (deltaBytes) => {
+                    assetLoadedBytes += deltaBytes;
+                    globalLoadedBytes += deltaBytes;
+
+                    const mbDone = (globalLoadedBytes / (1024 * 1024)).toFixed(2);
+                    const mbTotal = (globalTotalBytes / (1024 * 1024)).toFixed(2);
+                    const ratio = Math.min(1, globalLoadedBytes / globalTotalBytes);
+                    // Map streaming download across 0.00 -> 0.85 of total progress
+                    const mappedProgress = ratio * 0.85;
+
+                    setUnityProgress(
+                      mappedProgress,
+                      `Downloading data... (${Math.round(ratio * 100)}%)`,
+                      `Stage: Streaming ${asset.match} (${globalCompletedParts}/${TOTAL_PARTS} parts)`,
+                      `${mbDone} MB / ${mbTotal} MB`
+                    );
+
+                    xhr.dispatchEvent(
+                      new ProgressEvent("progress", {
+                        lengthComputable: true,
+                        loaded: Math.max(0, assetLoadedBytes),
+                        total,
+                      })
+                    );
+                  }
+                );
+                globalCompletedParts++;
+              });
+
+              logStatus(`Completed streaming ${asset.match} (${(total / (1024 * 1024)).toFixed(2)} MB).`);
+
+              state.status = 200;
+              state.statusText = "OK";
+              state.response = singleBuffer.buffer;
+              state.readyState = 4;
+
+              xhr.dispatchEvent(new Event("readystatechange"));
+              xhr.dispatchEvent(
+                new ProgressEvent("progress", {
+                  lengthComputable: true,
+                  loaded: total,
+                  total,
+                })
+              );
+              xhr.dispatchEvent(new Event("load"));
+              xhr.dispatchEvent(new Event("loadend"));
+            } catch (err) {
+              hasFatalError = true;
+              reportError(`StreamXHR:${asset.match}`, err);
+              unityApiStatus.textContent = "FATAL ERROR — Loading halted (see error log below)";
+              state.status = 0;
+              state.readyState = 4;
+              xhr.dispatchEvent(new Event("readystatechange"));
+              xhr.dispatchEvent(new Event("error"));
+              xhr.dispatchEvent(new Event("loadend"));
+            }
+          })();
+        };
+      }
+
+      function releaseDownloadedBuffers() {
+        if (activeBufferReleasers.length === 0) return;
+        while (activeBufferReleasers.length > 0) {
+          const release = activeBufferReleasers.pop();
+          release();
+        }
+        logStatus("Released intermediate download buffers so browser GC can reclaim RAM.");
       }
 
       function hideLoadingScreen() {
@@ -391,33 +554,10 @@
         loadingScreen.style.display = "none";
       }
 
-      (async () => {
+      (() => {
         try {
-          logStatus(`Base URI: ${document.baseURI}`);
-          logStatus("Starting Unity WebGL asset preloader...");
-
-          const [dataUrl, wasmUrl, asmUrl] = await Promise.all([
-            mergeFiles(getParts("Build/CupheadPort.data.unityweb", 1, 103), "CupheadPort.data.unityweb"),
-            mergeFiles(getParts("Build/CupheadPort.wasm.code.unityweb", 1, 2), "CupheadPort.wasm.code.unityweb"),
-            mergeFiles(getParts("Build/CupheadPort.asm.code.unityweb", 1, 3), "CupheadPort.asm.code.unityweb"),
-          ]);
-
-          const originalOpen = XMLHttpRequest.prototype.open;
-          XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-            if (typeof url === "string") {
-              if (url.includes("CupheadPort.data.unityweb")) {
-                url = dataUrl;
-              } else if (url.includes("CupheadPort.wasm.code.unityweb")) {
-                url = wasmUrl;
-              } else if (url.includes("CupheadPort.asm.code.unityweb")) {
-                url = asmUrl;
-              }
-            }
-            return originalOpen.call(this, method, url, ...rest);
-          };
-
           if (typeof UnityLoader === "undefined") {
-            throw new Error("UnityLoader is undefined. Build/UnityLoader.js failed to initialize.");
+            throw new Error("UnityLoader is undefined. Build/UnityLoader.js failed to load.");
           }
 
           if (UnityLoader.Error) {
@@ -427,34 +567,26 @@
             };
           }
 
+          installStreamingXHRInterceptor();
+          logStatus("Single-buffer streaming XHR interceptor installed.");
           logStatus("Calling UnityLoader.instantiate('gameContainer', 'Build/CupheadPort.json')...");
-          setUnityProgress(
-            0.75,
-            "Downloading data... (0%)",
-            "Stage: UnityLoader Instantiation",
-            "Loading Build/CupheadPort.json"
-          );
 
           let lastReportedStage = "";
 
           function UnityProgress(unityInstance, progress) {
             if (!unityInstance.Module) return;
 
-            const combinedProgress = 0.75 + progress * 0.25;
             const unityPct = Math.round(progress * 100);
 
             if (progress < 0.9) {
-              setUnityProgress(
-                combinedProgress,
-                `Downloading data... (${unityPct}%)`,
-                `Stage: Unity WebGL Data/Code Unpack (onProgress: ${progress.toFixed(2)})`,
-                `Unity Progress: ${unityPct}%`
-              );
               if (lastReportedStage !== "downloading") {
                 lastReportedStage = "downloading";
                 logStatus("Unity WebGL API: Downloading data...");
               }
             } else if (progress < 1) {
+              // Unity has finished reading XHR responses and is now compiling WASM / initializing runtime
+              releaseDownloadedBuffers();
+              const combinedProgress = 0.85 + ((progress - 0.9) / 0.1) * 0.15;
               setUnityProgress(
                 combinedProgress,
                 `Preparing... (${unityPct}%)`,
@@ -466,6 +598,7 @@
                 logStatus("Unity WebGL API: Preparing... (Compiling WebAssembly & initializing engine)");
               }
             } else {
+              releaseDownloadedBuffers();
               setUnityProgress(
                 1.0,
                 "Running... (100%)",
@@ -476,7 +609,7 @@
                 lastReportedStage = "running";
                 logStatus("Unity WebGL API: Running... (Initialization complete)");
               }
-              setTimeout(hideLoadingScreen, 150);
+              setTimeout(hideLoadingScreen, 200);
             }
           }
 
@@ -492,8 +625,8 @@
                 },
                 printErr: function (text) {
                   reportError("UnityModule.printErr", text);
-                }
-              }
+                },
+              },
             }
           );
         } catch (err) {
