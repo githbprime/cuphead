@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="en-us">
   <head>
-    <base href="https://cdn.jsdelivr.net/gh/web-ports/cuphead@c9ff1b6b16f9d402b78a42fc2200e1c076c0ab6e/">
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <title>Unity WebGL Player | Cuphead</title>
@@ -180,7 +179,6 @@
       const statusLog = document.getElementById("status-log");
 
       let hasFatalError = false;
-      let isLoaded = false;
 
       // Alternate between "LOADING.", "LOADING..", and "LOADING..."
       const loadingFrames = ["LOADING.", "LOADING..", "LOADING..."];
@@ -221,7 +219,6 @@
         if (transferText !== undefined) subStatusRight.textContent = transferText;
       }
 
-      // Global error listeners to catch and display all runtime/network/Unity errors
       window.addEventListener("error", (event) => {
         hasFatalError = true;
         reportError("WindowError", event.error || `${event.message} (${event.filename}:${event.lineno})`);
@@ -241,20 +238,20 @@
 
     <script
       src="Build/UnityLoader.js"
-      onerror="hasFatalError = true; reportError('ScriptLoad', 'Failed to load Build/UnityLoader.js');"
+      onerror="hasFatalError = true; reportError('ScriptLoad', 'Failed to load ' + new URL('Build/UnityLoader.js', document.baseURI).href);"
     ></script>
 
     <script>
       const EXPECTED_TOTAL_MB = 2101.31;
       const EXPECTED_TOTAL_BYTES = EXPECTED_TOTAL_MB * 1024 * 1024;
       const TOTAL_PARTS = 103 + 2 + 3; // 108 total split chunks
+      const MAX_CONCURRENT_DOWNLOADS = 6;
       let loadedBytes = 0;
       let completedParts = 0;
 
       function updateDownloadProgress(currentFile) {
         const mbDone = (loadedBytes / (1024 * 1024)).toFixed(2);
         const totalMbDisplay = Math.max(EXPECTED_TOTAL_MB, parseFloat(mbDone)).toFixed(2);
-        // Map asset chunk download to 0.00 - 0.75 of overall load before UnityLoader takes over (0.75 - 1.00)
         const rawRatio = Math.min(1, loadedBytes / EXPECTED_TOTAL_BYTES);
         const mappedProgress = rawRatio * 0.75;
 
@@ -266,49 +263,74 @@
         );
       }
 
-      async function fetchWithProgress(url) {
-        let response;
-        try {
-          response = await fetch(url);
-        } catch (networkErr) {
-          throw new Error(`Network failure while requesting ${url}: ${networkErr.message}`);
+      async function fetchWithProgress(url, retries = 2) {
+        const resolvedUrl = new URL(url, document.baseURI).href;
+
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          let attemptBytes = 0;
+          try {
+            const response = await fetch(resolvedUrl);
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} (${response.statusText}) while fetching ${resolvedUrl}`);
+            }
+
+            if (!response.body) {
+              const buffer = await response.arrayBuffer();
+              loadedBytes += buffer.byteLength;
+              completedParts++;
+              updateDownloadProgress(url);
+              return buffer;
+            }
+
+            const reader = response.body.getReader();
+            const chunks = [];
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              attemptBytes += value.length;
+              loadedBytes += value.length;
+              chunks.push(value);
+              updateDownloadProgress(url);
+            }
+
+            completedParts++;
+            updateDownloadProgress(url);
+
+            const fullBuffer = new Uint8Array(attemptBytes);
+            let offset = 0;
+            for (const chunk of chunks) {
+              fullBuffer.set(chunk, offset);
+              offset += chunk.length;
+            }
+            return fullBuffer.buffer;
+          } catch (err) {
+            // Roll back partial bytes from a failed attempt before retrying
+            loadedBytes = Math.max(0, loadedBytes - attemptBytes);
+            if (attempt < retries) {
+              logStatus(`Retrying ${url} (attempt ${attempt + 2}/${retries + 1}): ${err.message}`, "warn");
+              await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+            } else {
+              throw new Error(`Failed to fetch ${resolvedUrl}: ${err.message}`);
+            }
+          }
+        }
+      }
+
+      async function mapWithConcurrency(items, limit, worker) {
+        const results = new Array(items.length);
+        let nextIndex = 0;
+
+        async function runWorker() {
+          while (nextIndex < items.length) {
+            const currentIndex = nextIndex++;
+            results[currentIndex] = await worker(items[currentIndex], currentIndex);
+          }
         }
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status} (${response.statusText}) while fetching ${url}`);
-        }
-
-        if (!response.body) {
-          const buffer = await response.arrayBuffer();
-          loadedBytes += buffer.byteLength;
-          completedParts++;
-          updateDownloadProgress(url);
-          return buffer;
-        }
-
-        const reader = response.body.getReader();
-        const chunks = [];
-        let received = 0;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          received += value.length;
-          loadedBytes += value.length;
-          chunks.push(value);
-          updateDownloadProgress(url);
-        }
-
-        completedParts++;
-        updateDownloadProgress(url);
-
-        const fullBuffer = new Uint8Array(received);
-        let offset = 0;
-        for (const chunk of chunks) {
-          fullBuffer.set(chunk, offset);
-          offset += chunk.length;
-        }
-        return fullBuffer.buffer;
+        const workers = Array.from({ length: Math.min(limit, items.length) }, () => runWorker());
+        await Promise.all(workers);
+        return results;
       }
 
       async function mergeFiles(fileParts, cacheKey) {
@@ -331,8 +353,10 @@
         }
 
         logStatus(`Downloading ${fileParts.length} part(s) for ${cacheKey}...`);
-        const buffers = await Promise.all(
-          fileParts.map((part) => fetchWithProgress(part))
+        const buffers = await mapWithConcurrency(
+          fileParts,
+          MAX_CONCURRENT_DOWNLOADS,
+          (part) => fetchWithProgress(part)
         );
 
         logStatus(`Merging ${buffers.length} buffer(s) into ${cacheKey}...`);
@@ -343,7 +367,6 @@
             await cache.put(cacheKey, new Response(mergedBlob));
             logStatus(`Cached ${cacheKey} (${(mergedBlob.size / (1024 * 1024)).toFixed(2)} MB)`);
           } catch (cacheWriteErr) {
-            // Log cache quota/storage error without halting boot
             logStatus(`[CacheWarning] Failed to store ${cacheKey} in Cache API: ${cacheWriteErr.message}`, "warn");
           }
         }
@@ -364,13 +387,13 @@
           logStatus("Loading screen kept visible because errors were recorded.", "warn");
           return;
         }
-        isLoaded = true;
         clearInterval(loadingAnimInterval);
         loadingScreen.style.display = "none";
       }
 
       (async () => {
         try {
+          logStatus(`Base URI: ${document.baseURI}`);
           logStatus("Starting Unity WebGL asset preloader...");
 
           const [dataUrl, wasmUrl, asmUrl] = await Promise.all([
@@ -414,20 +437,16 @@
 
           let lastReportedStage = "";
 
-          // Official Unity WebGL UnityProgress(unityInstance, progress) reporting
           function UnityProgress(unityInstance, progress) {
             if (!unityInstance.Module) return;
 
-            // Map Unity's 0.0 -> 1.0 progress onto 0.75 -> 1.00 of the combined bar,
-            // while reporting Unity WebGL's exact API states & percentage.
             const combinedProgress = 0.75 + progress * 0.25;
             const unityPct = Math.round(progress * 100);
 
             if (progress < 0.9) {
-              const stageMsg = `Downloading data... (${unityPct}%)`;
               setUnityProgress(
                 combinedProgress,
-                stageMsg,
+                `Downloading data... (${unityPct}%)`,
                 `Stage: Unity WebGL Data/Code Unpack (onProgress: ${progress.toFixed(2)})`,
                 `Unity Progress: ${unityPct}%`
               );
@@ -436,10 +455,9 @@
                 logStatus("Unity WebGL API: Downloading data...");
               }
             } else if (progress < 1) {
-              const stageMsg = `Preparing... (${unityPct}%)`;
               setUnityProgress(
                 combinedProgress,
-                stageMsg,
+                `Preparing... (${unityPct}%)`,
                 `Stage: Compiling WebAssembly & Initializing Runtime (onProgress: ${progress.toFixed(2)})`,
                 `Unity Progress: ${unityPct}%`
               );
